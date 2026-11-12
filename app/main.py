@@ -1,25 +1,28 @@
-"""FastAPI entrypoint for the scan-time normalization service."""
+"""FastAPI entrypoint: scan-time normalization plus subscription consumption."""
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import solver
-from .schemas import (
-    ErrorResponse,
-    InvalidRecordInfo,
-    LinkInfo,
-    NormalizeRequest,
-    NormalizeResponse,
-    RecordOut,
-    Summary,
+from . import storage
+from .errors import register_exception_handlers
+from .schemas import ErrorResponse, NormalizeRequest, NormalizeResponse
+from .subscriptions import (
+    NormalizationRejected,
+    router as subscriptions_router,
+    run_normalization,
 )
 
 DESCRIPTION = """
-Normalize carrier-exported local scan times to UTC under IANA timezone rules.
+Normalize carrier-exported local scan times to UTC under IANA timezone rules,
+and let multiple warehouse-ingestion tasks consume the confirmed scan batches
+durable via a SQLite-backed subscription API.
+
+## `/normalize` — one-shot normalization
 
 * Each record's local time yields **0, 1 or 2 legal UTC candidates**
   (DST fall-back duplicates a local time; spring-forward makes one nonexistent).
@@ -30,8 +33,24 @@ Normalize carrier-exported local scan times to UTC under IANA timezone rules.
   * exactly one → `determined` (确定), returned as `utc`;
   * several → `needs_review` (待核对), all candidates returned, none picked.
 * If any record has no legal candidate, or the links are mutually inconsistent,
-  the request fails with **HTTP 409** and a precise reason — no partial
-  conversion is ever returned.
+  the request fails with **HTTP 409** — no partial conversion is ever returned.
+
+## `/subscriptions` — durable batch consumption
+
+* `POST /subscriptions/deliveries` submits a delivery number plus the same
+  normalization request. The **complete result is saved and assigned a
+  monotonically increasing batch number only when every record is
+  UTC-determined**. Same delivery id + same content returns the original
+  batch; changed content is rejected (409).
+* Each registered subscriber starts from the first batch and always claims the
+  **earliest unconfirmed whole batch**, receiving a unique lease id with a
+  **30-second lease**. Concurrent claims of a leased batch are rejected; once
+  the lease lapses the batch can be re-claimed with a **new** lease id, and the
+  old id can no longer advance progress.
+* Confirming a valid lease advances exactly that subscriber's progress;
+  re-confirming returns the original receipt. Different subscribers never block
+  each other, and batches, progress, leases and receipts all persist in SQLite —
+  no batch is skipped across concurrent calls, lost responses or restarts.
 """
 
 DEMO_DST_FALLBACK = {
@@ -67,11 +86,26 @@ DEMO_CONFLICTING_LINKS = {
     ],
 }
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Ensure SQLite tables exist before serving (idempotent on every start).
+    storage.init_db()
+    yield
+
+
 app = FastAPI(
-    title="Scan Time Normalizer",
+    title="Scan Time Normalizer & Batch Subscription API",
     description=DESCRIPTION,
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=_lifespan,
 )
+app.include_router(subscriptions_router)
+register_exception_handlers(app)
+
+
+@app.exception_handler(NormalizationRejected)
+async def _normalization_rejected_handler(_request: Request, exc: NormalizationRejected) -> JSONResponse:
+    return JSONResponse(status_code=409, content=exc.body)
 
 
 @app.get("/", include_in_schema=False)
@@ -80,7 +114,11 @@ def root() -> dict:
         "service": "scan-time-normalizer",
         "docs": "/docs",
         "normalize": "POST /normalize",
-        "health": "/healthz",
+        "submit_batch": "POST /subscriptions/deliveries",
+        "register_subscriber": "POST /subscriptions/subscribers",
+        "claim": "POST /subscriptions/claim",
+        "confirm": "POST /subscriptions/confirm",
+        "health": "GET /healthz",
     }
 
 
@@ -121,66 +159,12 @@ def normalize_endpoint(
             }
         ),
     ],
-) -> NormalizeResponse | JSONResponse:
-    outcome = solver.normalize(
-        records=[solver.ScanInput(r.id, r.local_time, r.timezone) for r in req.records],
-        links=[solver.LinkInput(l.from_id, l.to_id, l.min_seconds, l.max_seconds) for l in req.links],
-    )
-
-    if isinstance(outcome, solver.NoLegalCandidate):
-        body = ErrorResponse(
-            error="no_legal_candidate",
-            message="Local time has no legal UTC reading under its timezone rules "
-                    "(it falls into a DST spring-forward gap). No partial conversion returned.",
-            invalid_records=[
-                InvalidRecordInfo(
-                    id=r.id,
-                    local_time=r.local_time,
-                    timezone=r.timezone,
-                    reason="local time does not exist in this timezone",
-                )
-                for r in outcome.records
-            ],
-        )
-        return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
-
-    if isinstance(outcome, solver.NoGlobalSolution):
-        body = ErrorResponse(
-            error="no_global_solution",
-            message="Transfer links are mutually inconsistent: no assignment of UTC "
-                    "candidates satisfies every interval simultaneously. The listed "
-                    "links form an irreducible conflict. No partial conversion returned.",
-            conflicting_links=[
-                LinkInfo(
-                    index=i,
-                    from_id=req.links[i].from_id,
-                    to_id=req.links[i].to_id,
-                    min_seconds=req.links[i].min_seconds,
-                    max_seconds=req.links[i].max_seconds,
-                )
-                for i in outcome.link_indices
-            ],
-            involved_records=outcome.record_ids,
-        )
-        return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
-
-    by_id = {r.id: r for r in req.records}
-    records_out = [
-        RecordOut(
-            id=res.id,
-            timezone=by_id[res.id].timezone,
-            local_time=by_id[res.id].local_time,
-            status=res.status,
-            utc=res.candidates[0] if res.status == "determined" else None,
-            candidates=res.candidates,
-        )
-        for res in outcome.results
-    ]
-    return NormalizeResponse(
-        summary=Summary(
-            total=len(records_out),
-            determined=sum(1 for r in records_out if r.status == "determined"),
-            needs_review=sum(1 for r in records_out if r.status == "needs_review"),
-        ),
-        records=records_out,
-    )
+) -> NormalizeResponse:
+    # The subscription gate (needs_review -> 409) only applies to batch
+    # submission; /normalize keeps returning needs_review candidates as before.
+    try:
+        return run_normalization(req)
+    except NormalizationRejected as exc:
+        if exc.body.get("error") == "not_all_utc_determined":
+            return NormalizeResponse(**exc.body["normalization"])
+        raise

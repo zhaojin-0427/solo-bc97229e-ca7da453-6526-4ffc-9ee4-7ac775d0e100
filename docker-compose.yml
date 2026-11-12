@@ -6,4 +6,14 @@ services:
     image: scan-time-normalizer:latest
     ports:
       - "8000:8000"
+    environment:
+      # SQLite file holding batches, subscriber progress, leases and receipts.
+      SCAN_DB_PATH: /data/scanwarehouse.db
+      # Claim lease duration in seconds (spec default: 30).
+      SCAN_LEASE_SECONDS: "30"
+    volumes:
+      - scanwarehouse_data:/data
     restart: unless-stopped
+
+volumes:
+  scanwarehouse_data:

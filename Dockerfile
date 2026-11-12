@@ -10,8 +10,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /data \
+    && chown -R appuser:appuser /app /data
 USER appuser
+
+ENV SCAN_DB_PATH=/data/scanwarehouse.db \
+    SCAN_LEASE_SECONDS=30
 
 EXPOSE 8000
 
